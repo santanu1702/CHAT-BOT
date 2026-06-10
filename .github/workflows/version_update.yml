@@ -1,0 +1,39 @@
+name: Version Update Workflow
+on:
+  workflow_run:
+    workflows:
+      - "CI"
+    branches:
+      - main
+    types:
+      - completed
+
+jobs:
+  version_update:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        persist-credentials: false # otherwise, the token used is the GITHUB_TOKEN, instead of your personal access token.
+        fetch-depth: 0
+    - name: Update version
+      run: |
+        VERSION=$(git describe --tags | cut -d'-' -f1)
+        touch __version__.py
+        echo "__version__ = '$VERSION'" > __version__.py
+    - name: Commit version update changes
+      run: |
+        echo ${GITHUB_ACTOR}
+        echo ${EMAIL}
+        git config --global user.name "${GITHUB_ACTOR}"
+        git config --global user.email "${EMAIL}"
+        git add __version__.py
+        git commit -m "Update version in __version__.py file" || true
+      env:
+        EMAIL: ${{ secrets.EMAIL }}
+    - name: Push changes # push the output folder to your repo
+      uses: ad-m/github-push-action@master
+      with:
+        github_token: ${{ secrets.GH_PAT }}
+        branch: main
+        force: true
