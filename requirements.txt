@@ -1,0 +1,23 @@
+# ─────────────────────────────────────────────
+#  Telegram AI Chatbot — Python Dependencies
+# ─────────────────────────────────────────────
+
+# Telegram Bot SDK (async, v20+)
+python-telegram-bot==21.6
+
+# OpenAI SDK (latest v1+)
+openai==1.54.3
+
+# Web server framework
+fastapi==0.115.4
+
+# ASGI server — plain install (no [standard] extra) to avoid uvloop
+# uvloop replaces asyncio's event loop policy and breaks python-telegram-bot
+# on Python 3.10+ where there is no implicit current event loop.
+uvicorn==0.32.0
+
+# Environment variable loading
+python-dotenv==1.0.1
+
+# HTTP client (used internally by openai and telegram)
+httpx==0.27.2
