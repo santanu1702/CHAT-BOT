@@ -2,17 +2,17 @@
 main.py — Application entry point
 Starts both the Telegram bot and the FastAPI web server concurrently.
 
-Architecture (fixed for Python 3.12+ / uvloop compatibility):
+Architecture:
   - A fresh asyncio event loop is created explicitly BEFORE uvicorn touches anything.
   - uvicorn runs inside that same loop as an asyncio Task (no threads needed).
   - python-telegram-bot runs as a second asyncio Task in the same loop.
-  - Both tasks are gathered and run until a stop signal is received.
 
-Root cause of the original error:
-  uvicorn[standard] pulls in uvloop, which replaces the default event-loop policy.
-  On Python 3.10+ there is NO implicit "current" event loop on the main thread —
-  you must create one explicitly. run_polling() called asyncio.get_event_loop()
-  before any loop existed, which raised RuntimeError.
+Fixes applied:
+  1. uvicorn plain (no [standard]) — prevents uvloop from replacing the event loop policy.
+  2. asyncio.new_event_loop() called before anything — ensures a loop always exists.
+  3. HTTPXRequest with raised connect/read timeouts — fixes TimedOut on Render free tier.
+  4. Polling uses read_timeout / write_timeout overrides — prevents getUpdates from timing out.
+  5. Retry logic in error_handler — silently retries on transient network errors.
 """
 
 import asyncio
@@ -28,6 +28,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 # ── Set up logging FIRST ───────────────────────────────────────────────────────
 from bot.utils.logger import setup_logging
@@ -72,10 +73,39 @@ async def post_init(application: Application) -> None:
 
 
 def build_application() -> Application:
-    """Build and configure the Telegram Application with all handlers."""
+    """
+    Build and configure the Telegram Application with all handlers.
+
+    Key fix: HTTPXRequest is configured with generous timeouts so the bot
+    doesn't crash on Render's free tier where cold-start network latency
+    can easily exceed the default 5-second timeout.
+
+      connect_timeout  — how long to wait to open a TCP connection to Telegram
+      read_timeout     — how long to wait for a response (getUpdates uses long-poll)
+      write_timeout    — how long to wait for a send request to complete
+      pool_timeout     — how long to wait for a connection from the pool
+    """
+    request = HTTPXRequest(
+        connect_timeout=15.0,   # seconds to establish TCP connection
+        read_timeout=30.0,      # seconds to wait for data (covers long-poll)
+        write_timeout=30.0,     # seconds to send a message
+        pool_timeout=15.0,      # seconds to get a connection from pool
+        http_version="1.1",     # HTTP/2 can cause issues on some proxied hosts
+    )
+
     application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .request(request)                 # <-- attach our custom HTTP client
+        .get_updates_request(             # <-- separate client for getUpdates
+            HTTPXRequest(
+                connect_timeout=15.0,
+                read_timeout=45.0,        # long-poll needs extra time
+                write_timeout=15.0,
+                pool_timeout=15.0,
+                http_version="1.1",
+            )
+        )
         .post_init(post_init)
         .build()
     )
@@ -110,37 +140,31 @@ def build_application() -> Application:
 
 async def run_all() -> None:
     """
-    Co-routine that starts both services inside a single asyncio event loop:
-      1. uvicorn  — serves /health on $PORT  (asyncio-native server)
+    Starts both services inside a single asyncio event loop:
+      1. uvicorn  — serves /health on $PORT
       2. Telegram — polls for updates
 
     We manually drive the Telegram Application lifecycle so we can await it
     alongside uvicorn without calling run_polling() (which creates its own loop).
     """
-    # ── uvicorn config (no loop kwarg — it uses the running loop automatically) ─
     uvi_config = uvicorn.Config(
         app=fastapi_app,
         host="0.0.0.0",
         port=PORT,
         log_level="warning",
         access_log=False,
-        # Disable uvloop/httptools workers — we're already inside asyncio
-        loop="none",
+        loop="none",   # use the already-running asyncio loop; don't install uvloop
     )
     uvi_server = uvicorn.Server(uvi_config)
 
-    # ── Build Telegram application ─────────────────────────────────────────────
     application = build_application()
 
     logger.info(f"Starting FastAPI web server on port {PORT}...")
     logger.info("Starting Telegram bot polling...")
 
     # ── Graceful shutdown on SIGINT / SIGTERM ──────────────────────────────────
-    stop_event = asyncio.Event()
-
     def _signal_handler():
         logger.info("Shutdown signal received.")
-        stop_event.set()
         uvi_server.should_exit = True
 
     loop = asyncio.get_running_loop()
@@ -148,22 +172,24 @@ async def run_all() -> None:
         try:
             loop.add_signal_handler(sig, _signal_handler)
         except (NotImplementedError, RuntimeError):
-            # Windows doesn't support add_signal_handler for all signals
-            pass
+            pass  # Windows doesn't support add_signal_handler
 
     # ── Run both concurrently ──────────────────────────────────────────────────
     async with application:
         await application.start()
-        # Start Telegram polling in the background
         await application.updater.start_polling(
             allowed_updates=["message", "callback_query"],
             drop_pending_updates=True,
+            # These override the per-request timeouts for getUpdates specifically
+            read_timeout=40,
+            write_timeout=30,
+            connect_timeout=15,
+            pool_timeout=15,
         )
 
-        # Run uvicorn (blocks until uvi_server.should_exit is True)
+        # Blocks here until uvi_server.should_exit is set
         await uvi_server.serve()
 
-        # uvicorn has exited — now stop the bot cleanly
         logger.info("Stopping Telegram bot...")
         await application.updater.stop()
         await application.stop()
@@ -177,33 +203,38 @@ def main() -> None:
     """
     Creates a brand-new asyncio event loop explicitly, then runs run_all().
 
-    WHY: On Python 3.10+ there is no implicit current loop. If uvicorn/uvloop
-    is imported before we create a loop, asyncio.get_event_loop() raises
-    RuntimeError. Creating the loop ourselves first avoids this entirely.
+    WHY explicit loop creation:
+      On Python 3.10+ there is no implicit "current" event loop on the main thread.
+      If uvicorn (even without uvloop) is imported first, asyncio.get_event_loop()
+      will raise RuntimeError. We create the loop ourselves to guarantee it exists.
     """
     logger.info("=" * 60)
     logger.info("  Telegram AI Chatbot — Starting up")
     logger.info("=" * 60)
 
-    # ── Database setup ─────────────────────────────────────────────────────────
     init_db()
     seed_admins(ADMIN_IDS)
     if ADMIN_IDS:
         logger.info(f"Admin IDs seeded: {ADMIN_IDS}")
     else:
         logger.warning(
-            "No ADMIN_IDS configured! Set ADMIN_IDS in your .env file "
-            "to enable admin commands."
+            "No ADMIN_IDS configured! Set ADMIN_IDS in your .env to enable admin commands."
         )
 
-    # ── Create event loop explicitly (fixes uvloop RuntimeError) ──────────────
+    # Create the event loop explicitly BEFORE anything touches asyncio internals
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     try:
         loop.run_until_complete(run_all())
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received, shutting down.")
+        logger.info("KeyboardInterrupt — shutting down.")
+    finally:
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()
     finally:
         loop.close()
 
