@@ -235,9 +235,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    finally:
-        loop.close()
-
-
-if __name__ == "__main__":
-    main()
+  
